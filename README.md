@@ -21,6 +21,7 @@ CapsLockSwitcher solves these problems by providing a dedicated, fast, and targe
 
 *   🚀 **Instant Switching:** Bypasses the standard macOS input source switching delay by using lower-level APIs.
 *   🎯 **User-Selectable Layouts:** Switches *only* between the two keyboard layouts you explicitly choose in its menu.
+*   🌐 **Caps Lock + Fn (Globe), direct selection:** *fork change* — pressing **Caps Lock activates layout 1 directly** and pressing the **Fn/Globe key activates layout 2 directly** (no cycling through layouts).
 *   🚫 **No Accidental Caps Lock:** Consumes the Caps Lock key press when switching, preventing the standard uppercase lock from activating. If the app isn't configured or loses permissions, the event is passed through, restoring default OS behavior.
 *   💡 **Lightweight & Native:** Runs as a background agent with no Dock icon. Uses standard macOS APIs (`CGEventTap`, Text Input Source Services) – no kernel extensions needed.
 *   ⚙️ **Simple Configuration:** All setup is done via a status bar menu item (looks like ⌨️). Clearly guides you through granting the necessary Accessibility permissions required for event monitoring.
@@ -57,8 +58,9 @@ CapsLockSwitcher solves these problems by providing a dedicated, fast, and targe
     *   Click on the **first** layout you want to switch between. A checkmark will appear next to it. The status text will update (e.g., "Select 1 more layout...").
     *   Click on the **second** layout you want to switch between. Another checkmark will appear.
 4.  **Activate Switching:**
-    *   Once two layouts are selected, the status bar icon will change to ⌨️ (`keyboard.fill`), and the status text will show "Switcher: Active".
-    *   **Press the Caps Lock key!** It will now instantly switch between the two layouts you selected.
+    *   Once two layouts are selected, the status bar icon will change to ⌨️ (`keyboard.fill`), and the status text will show "Active: Caps Lock → <layout 1>, Fn → <layout 2>".
+    *   **Press Caps Lock** to instantly activate the first layout, or **press the Fn (Globe) key** to instantly activate the second.
+    *   **Note (Fn/Globe):** the tap is only delivered to the app when the system setting **System Settings > Keyboard > "Press 🌐 key to"** is set to **"Do Nothing"**. The app's menu shows the current state of this setting and can fix it for you. Holding Fn as a modifier (fn+F1, fn+letters, ...) does **not** switch the layout.
 5.  **(Optional) Launch on Startup:**
     *   Click the status bar icon.
     *   Select "Launch on Startup" to toggle the setting (requires macOS 13+). A checkmark indicates it's enabled.

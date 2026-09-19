@@ -20,10 +20,10 @@ extension Logger {
     static let timer = Logger(subsystem: subsystem, category: "PermissionTimer")
 }
 
-// MARK: - Global Event Tap Callback (SYNCHRONOUS - Listens for LANG)
+// MARK: - Global Event Tap Callback (SYNCHRONOUS - Listens for CapsLock/LANG1 and Fn/Globe)
 
 private func eventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
-    guard type == .keyDown else {
+    guard type == .keyDown || type == .keyUp || type == .flagsChanged else {
         return Unmanaged.passRetained(event)
     }
 
@@ -35,29 +35,62 @@ private func eventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
     let delegate = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
 
     let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-    
-    //Logger.eventTap.error("Code:  \(keyCode) ")
-    
-    guard keyCode == delegate.triggerKeyCode else {
+    Logger.eventTap.debug("Tap event: \(type == .keyDown ? "keyDown" : (type == .keyUp ? "keyUp" : "flagsChanged")), code: \(keyCode)")
+
+    // --- Caps Lock (remapped by hidutil to LANG1, keycode 104): activate layout slot 1 ---
+    if type == .keyDown && keyCode == Int64(delegate.triggerKeyCode) {
+        // *** SAFETY CHECK: skip TIS calls if permissions are known to be missing ***
+        guard delegate.checkKnownPermissionsFlag() else {
+            // Log already happens inside checkKnownPermissionsFlag if false
+            return Unmanaged.passRetained(event) // Pass LANG through if permissions are known to be missing
+        }
+        // Direct selection is idempotent: key repeats can never cause a double switch
+        let shouldConsume = delegate.performSwitchSync(slot: 1)
+        if shouldConsume {
+            return nil // Consume the LANG event
+        } else {
+            return Unmanaged.passRetained(event) // Pass through (e.g., if state wasn't .active)
+        }
+    }
+
+    // --- Fn/Globe key (keycode 179): activate layout slot 2 on a *tap* ---
+    if keyCode == Int64(delegate.globeKeyCode) {
+        switch type {
+        case .keyDown:
+            delegate.globeKeyDownUptime = ProcessInfo.processInfo.systemUptime
+            delegate.otherKeyPressedWhileGlobeDown = false
+        case .keyUp:
+            let startTime = delegate.globeKeyDownUptime
+            delegate.globeKeyDownUptime = 0 // Always reset, regardless of the outcome
+            let heldFor = ProcessInfo.processInfo.systemUptime - startTime
+            // Count as a tap only if released quickly and no other key was pressed while held,
+            // so using Fn as a modifier (fn+F1, fn+letter, ...) never switches the layout.
+            let wasTap = startTime > 0
+                && heldFor <= delegate.globeTapMaxDuration
+                && !delegate.otherKeyPressedWhileGlobeDown
+            Logger.eventTap.debug("Globe key released after \(heldFor)s; tap=\(wasTap)")
+            guard wasTap else { break }
+            guard delegate.checkKnownPermissionsFlag() else {
+                return Unmanaged.passRetained(event)
+            }
+            let shouldConsume = delegate.performSwitchSync(slot: 2)
+            if shouldConsume {
+                return nil // Attempt to consume the Globe event (no-op for .listenOnly taps)
+            } else {
+                return Unmanaged.passRetained(event)
+            }
+        default:
+            break // flagsChanged: fn flag press/release, diagnostics only
+        }
         return Unmanaged.passRetained(event)
     }
 
-    // *** THIS IS THE KEY SAFETY CHECK (Option 1) ***
-    // Check the permission flag *before* potentially calling TIS functions
-    guard delegate.checkKnownPermissionsFlag() else {
-        // Log already happens inside checkKnownPermissionsFlag if false
-        return Unmanaged.passRetained(event) // Pass LANG through if permissions are known to be missing
+    // --- Any other key pressed while the Globe key is down → it's a chord (fn+key), not a tap ---
+    if type == .keyDown && delegate.globeKeyDownUptime > 0 {
+        delegate.otherKeyPressedWhileGlobeDown = true
     }
-    // **********************************************
 
-    // Proceed with the switch logic only if the flag check passed
-    let shouldConsume = delegate.performSwitchIfActiveSync()
-
-    if shouldConsume {
-        return nil // Consume the LANG event
-    } else {
-        return Unmanaged.passRetained(event) // Pass through (e.g., if state wasn't .active)
-    }
+    return Unmanaged.passRetained(event)
 }
 
 // MARK: - AppDelegate
@@ -74,7 +107,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let hidCapsLockUsage = 0x700000039
     private let hidLangKeyUsage = 0x700000090 // Keyboard LANG1
+    /// Caps Lock is remapped by hidutil to LANG1, which macOS delivers as keyDown keycode 104
     internal let triggerKeyCode = CGKeyCode(104)
+    /// Globe/Fn key on Apple keyboards (macOS 10.14+): delivered as keyDown/keyUp keycode 179
+    internal let globeKeyCode = CGKeyCode(179)
 
     fileprivate enum AppOperationalState: String, CustomStringConvertible {
         case permissionsRequired = "Permissions Required"
@@ -85,6 +121,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private var isShowingPermissionAlert = false
+
+    // --- Globe (Fn) key tap tracking (only touched from the event tap callback on the main run loop) ---
+    fileprivate var globeKeyDownUptime: TimeInterval = 0
+    fileprivate var otherKeyPressedWhileGlobeDown = false
+    /// A Globe press counts as a "tap" (layout switch) only if released within this time
+    /// and with no other key pressed in between (so fn-as-modifier chords don't switch).
+    fileprivate let globeTapMaxDuration: TimeInterval = 0.5
 
     private var statusItem: NSStatusItem?
     private var appMenu: NSMenu?
@@ -343,70 +386,65 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return .configuring
     }
 
-    // MARK: - Synchronous Event Handling (Called from C callback for LANG)
+    // MARK: - Synchronous Event Handling (Called from C callback)
 
-    /// Performs the input source switch if the app is in the Active state.
+    /// Directly activates the layout bound to `slot` (1 = Caps Lock, 2 = Fn/Globe) if the app is Active.
     /// Called SYNCHRONOUSLY from the event tap callback. Must be non-blocking.
     /// Assumes permission check (`checkKnownPermissionsFlag`) already passed.
-    fileprivate func performSwitchIfActiveSync() -> Bool {
+    /// Idempotent: selecting the layout that is already active is a no-op, so repeated
+    /// events (key repeat, extra flagsChanged) can never cause a double switch.
+    fileprivate func performSwitchSync(slot: Int) -> Bool {
         // 1. Check Operational State (Primary check after permission flag)
         guard state.currentOperationalState == .active else {
-            // This log indicates LANG was pressed but the app wasn't fully ready (e.g., configuring)
-            Logger.eventTap.debug("SYNC Switch: Pass through. State is not Active (\(self.state.currentOperationalState.description)).")
+            // This log indicates a trigger key was pressed but the app wasn't fully ready (e.g., configuring)
+            Logger.eventTap.debug("SYNC Switch(slot \(slot)): Pass through. State is not Active (\(self.state.currentOperationalState.description)).")
             return false // State not active, pass event through
         }
 
-        // 2. Check Target References (Safety check, should always be valid in .active state)
-        guard let source1 = state.targetSource1Ref, let source2 = state.targetSource2Ref else {
-             Logger.eventTap.error("SYNC Switch FAIL: Missing target refs in Active state. This shouldn't happen.")
-             // Consider this a failure state, consume the event to prevent unexpected LANG behavior? Or pass through?
-             // Let's consume it to prevent potential issues.
+        // 2. Resolve the target layout for this slot (safety check, should always be valid in .active state)
+        let targetSource: TISInputSource?
+        let targetIdLog: String
+        if slot == 1 {
+            targetSource = state.targetSource1Ref
+            targetIdLog = state.selectedSourceID1 ?? "Target1 (ID unknown)"
+        } else {
+            targetSource = state.targetSource2Ref
+            targetIdLog = state.selectedSourceID2 ?? "Target2 (ID unknown)"
+        }
+
+        guard let target = targetSource else {
+             Logger.eventTap.error("SYNC Switch(slot \(slot)) FAIL: Missing target ref for '\(targetIdLog)' in Active state. This shouldn't happen.")
+             // Consume the event to prevent unexpected trigger-key behavior.
              return true
         }
 
-        // 3. Get Current Input Source
+        // 3. Get Current Input Source (to skip the switch if the requested layout is already active)
         guard let currentSourceUnmanaged = TISCopyCurrentKeyboardInputSource() else {
-             Logger.eventTap.error("SYNC Switch FAIL: TISCopyCurrentKeyboardInputSource returned nil.")
+             Logger.eventTap.error("SYNC Switch(slot \(slot)) FAIL: TISCopyCurrentKeyboardInputSource returned nil.")
              return true // Consume event on failure
         }
         let currentSource = currentSourceUnmanaged.takeRetainedValue() // Balance the retain
 
-        // 4. Get Current Source ID (for comparison)
-         guard let currentSourceID = getInputSourceID(currentSource) else {
-             Logger.eventTap.error("SYNC Switch FAIL: Could not get current source ID.")
-             return true // Consume event on failure
-         }
-
-        // 5. Determine Target Source
-        // Ensure we handle the case where currentSourceID might not match *either* selected ID
-        // (e.g., if user manually switched to a 3rd layout via system menu)
-        let targetSource: TISInputSource
-        let targetIdLog: String
-        if currentSourceID == state.selectedSourceID1 {
-            targetSource = source2
-            targetIdLog = state.selectedSourceID2 ?? "Target2 (ID unknown)"
-        } else {
-            // Default to source1 if current is not source1 (covers source2 and any other layout)
-            targetSource = source1
-            targetIdLog = state.selectedSourceID1 ?? "Target1 (ID unknown)"
+        let targetID = (slot == 1) ? state.selectedSourceID1 : state.selectedSourceID2
+        if let currentSourceID = getInputSourceID(currentSource), currentSourceID == targetID {
+            Logger.eventTap.debug("SYNC Switch(slot \(slot)): Already on '\(currentSourceID)'. No-op.")
+            return true // Consume the event, nothing to switch
         }
 
-        Logger.eventTap.debug("SYNC Switching: Current='\(currentSourceID)', Target='\(targetIdLog)'")
+        Logger.eventTap.debug("SYNC Switch(slot \(slot)): Current='\(self.getInputSourceID(currentSource) ?? "?")', Selecting='\(targetIdLog)'")
 
-        // 6. Perform the Switch
-        let status = TISSelectInputSource(targetSource)
+        // 4. Perform the Switch
+        let status = TISSelectInputSource(target)
 
-        // 7. Log Result
+        // 5. Log Result
         if status != noErr {
              // Log the specific Carbon error code
-             Logger.eventTap.error("SYNC Switch FAILED: TISSelectInputSource returned error \(status).")
-             // Still consume the event, as an attempt was made based on app state
-             return true
+             Logger.eventTap.error("SYNC Switch(slot \(slot)) FAILED: TISSelectInputSource returned error \(status).")
         } else {
-             Logger.eventTap.debug("SYNC Switch: Success.")
-             // Successfully switched, consume the LANG event
-             return true
+             Logger.eventTap.debug("SYNC Switch(slot \(slot)): Success.")
         }
+        // Consume the event either way: an attempt was made based on app state
+        return true
     }
 
 
@@ -496,6 +534,141 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
 
+    // MARK: - Globe (Fn) Key System Action ("Press 🌐 key to")
+
+    private enum GlobeMenuItemTag {
+        static let status = "globeStatus"
+        static let fix = "globeFix"
+        static let openSettings = "globeOpenSettings"
+    }
+
+    /// System setting "Press 🌐 key to" (com.apple.HIToolbox, AppleFnUsageType).
+    private enum GlobeKeySystemAction: Int, CustomStringConvertible {
+        case doNothing = 0
+        case showEmoji = 1
+        case changeInputSource = 2
+        case startDictation = 3
+
+        var description: String {
+            switch self {
+            case .doNothing: return "Do Nothing"
+            case .showEmoji: return "Show Emoji & Symbols"
+            case .changeInputSource: return "Change Input Source"
+            case .startDictation: return "Start Dictation"
+            }
+        }
+    }
+
+    /// Reads the current "Press 🌐 key to" system setting.
+    private var currentGlobeKeyAction: GlobeKeySystemAction {
+        guard let value = CFPreferencesCopyAppValue("AppleFnUsageType" as CFString, "com.apple.HIToolbox" as CFString) else {
+            return .showEmoji // macOS default when the preference has never been set
+        }
+        let raw = (value as? NSNumber)?.intValue ?? -1
+        return GlobeKeySystemAction(rawValue: raw) ?? .showEmoji
+    }
+
+    /// The Fn (Globe) key only reaches the app's event tap (and does nothing on its own)
+    /// when the system action for it is "Do Nothing".
+    private func updateGlobeKeyMenuItems(in menu: NSMenu) {
+        dispatchPrecondition(condition: .onQueue(DispatchQueue.main))
+
+        // Remove previous globe items (rebuilt fresh on every menu update)
+        for item in menu.items where (item.representedObject as? String)?.hasPrefix("globe") == true {
+            menu.removeItem(item)
+        }
+
+        // Insert right after the second separator (between the layout list and app options)
+        let separatorIndexes = menu.items.enumerated().filter { $0.element.isSeparatorItem }.map { $0.offset }
+        guard separatorIndexes.count >= 2 else {
+            Logger.ui.error("Globe menu: expected at least 2 separators, found \(separatorIndexes.count).")
+            return
+        }
+        var insertIndex = separatorIndexes[1] + 1
+
+        let action = currentGlobeKeyAction
+        let isConfigured = (action == .doNothing)
+
+        let statusLine = NSMenuItem(
+            title: isConfigured ? "Fn (Globe) key: Do Nothing ✓" : "Fn (Globe) key: \(action.description) ⚠️",
+            action: nil,
+            keyEquivalent: "")
+        statusLine.isEnabled = false
+        statusLine.representedObject = GlobeMenuItemTag.status
+        menu.insertItem(statusLine, at: insertIndex)
+        insertIndex += 1
+
+        if !isConfigured {
+            let fixItem = NSMenuItem(title: "Fix: Set to “Do Nothing”", action: #selector(fixGlobeKeyAction(_:)), keyEquivalent: "")
+            fixItem.target = self
+            fixItem.isEnabled = true
+            fixItem.representedObject = GlobeMenuItemTag.fix
+            menu.insertItem(fixItem, at: insertIndex)
+            insertIndex += 1
+
+            let openItem = NSMenuItem(title: "Open Keyboard Settings", action: #selector(openKeyboardSettingsAction), keyEquivalent: "")
+            openItem.target = self
+            openItem.isEnabled = true
+            openItem.representedObject = GlobeMenuItemTag.openSettings
+            menu.insertItem(openItem, at: insertIndex)
+        }
+    }
+
+    /// Sets the system "Press 🌐 key to" option to "Do Nothing" (AppleFnUsageType = 0)
+    /// so that Globe/Fn taps reach the event tap instead of the system handlers.
+    @objc func fixGlobeKeyAction(_ sender: NSMenuItem) {
+        dispatchPrecondition(condition: .onQueue(DispatchQueue.main))
+        Logger.settings.info("Setting com.apple.HIToolbox AppleFnUsageType → 0 (Do Nothing)")
+
+        CFPreferencesSetValue("AppleFnUsageType" as CFString,
+                              NSNumber(value: GlobeKeySystemAction.doNothing.rawValue),
+                              "com.apple.HIToolbox" as CFString,
+                              kCFPreferencesCurrentUser,
+                              kCFPreferencesAnyHost)
+        CFPreferencesAppSynchronize("com.apple.HIToolbox" as CFString)
+
+        // Verify the change actually landed (a successful call ≠ applied value)
+        let applied = currentGlobeKeyAction == .doNothing
+
+        // Defer the alert so we don't run a modal loop inside menu tracking
+        DispatchQueue.main.async { [weak self] in
+            guard let strongSelf = self else { return }
+            strongSelf.showGlobeKeyFixResult(applied: applied)
+        }
+    }
+
+    private func showGlobeKeyFixResult(applied: Bool) {
+        dispatchPrecondition(condition: .onQueue(DispatchQueue.main))
+        guard NSApplication.shared.modalWindow == nil else {
+            Logger.ui.warning("Globe key fix alert skipped: Another modal window is already visible.")
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = applied ? .informational : .warning
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Open Keyboard Settings")
+        if applied {
+            alert.messageText = "Globe key setting updated"
+            alert.informativeText = "'Press 🌐 key to' is now 'Do Nothing'.\n\nIf pressing Fn still doesn't switch the layout right away, log out and back in so macOS picks up the new setting."
+        } else {
+            alert.messageText = "Could not update the setting automatically"
+            alert.informativeText = "Please set 'Press 🌐 key to' to 'Do Nothing' manually in System Settings > Keyboard."
+        }
+        let response = alert.runModal()
+        if response == .alertSecondButtonReturn {
+            openKeyboardSettingsAction()
+        }
+        determineStateAndSetupUI(context: "GlobeKeyActionFix")
+    }
+
+    @objc func openKeyboardSettingsAction() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        } else {
+            NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/System Settings.app"))
+        }
+    }
+
     // MARK: - Alert Logic (Called Asynchronously from Main Thread)
 
     private func showAccessibilityInstructionsAlert(triggeredByUserAction: Bool) {
@@ -553,7 +726,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let alert = NSAlert()
         alert.messageText = "Welcome to \(Bundle.main.appName)!"
-        alert.informativeText = "Ready to configure!\n\n1. Click the \(Bundle.main.appName) menu bar icon.\n\n2. Select exactly two keyboard layouts you want to switch between.\n\n3. Press Caps Lock (now acting as a layout switcher) to instantly toggle between them!"
+        alert.informativeText = "Ready to configure!\n\n1. Click the \(Bundle.main.appName) menu bar icon.\n\n2. Select exactly two keyboard layouts: the first is activated by Caps Lock, the second by the Fn (Globe) key.\n\n3. Make sure the system setting 'Press 🌐 key to' is set to 'Do Nothing' (the app's menu can fix this for you).\n\n4. Press Caps Lock or Fn to instantly activate the layout you need!"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
 
@@ -690,7 +863,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             case .active:
                 iconName = "keyboard.fill"
                 fallbackTitle = "⌨️" // Keyboard emoji
-                accessibilityDescription = "\(Bundle.main.appName): Active (Caps Lock Remapped)"
+                accessibilityDescription = "\(Bundle.main.appName): Active (Caps Lock → Layout 1, Fn/Globe → Layout 2)"
         }
 
         // Attempt to use SF Symbol first
@@ -723,7 +896,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let statusItem = self.statusMenuItem { // Use the stored reference
             switch state.currentOperationalState {
             case .active:
-                statusItem.title = "Switcher: Active" // Simplified title
+                statusItem.title = "Active: Caps Lock → \(displayName(forSourceID: state.selectedSourceID1)), Fn → \(displayName(forSourceID: state.selectedSourceID2))"
             case .configuring:
                 statusItem.title = (state.availableSelectionCount == 1) ? "Select 1 more layout..." : "Select 2 layouts..."
             default: // Should not happen based on guard, but good practice
@@ -736,6 +909,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Update Layout List Items
         updateLayoutMenuItems(in: menu)
+
+        // Update Globe (Fn) key status section
+        updateGlobeKeyMenuItems(in: menu)
     }
 
 
@@ -775,11 +951,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 continue
             }
 
-            let menuItem = NSMenuItem(title: name, action: #selector(layoutMenuItemSelected(_:)), keyEquivalent: "")
+            // Annotate which hot key activates the selected layouts (slot 1 = Caps Lock, slot 2 = Fn/Globe)
+            var title = name
+            var hotKeyNote: String? = nil
+            if id == state.selectedSourceID1 {
+                title += "   ⇪ Caps Lock"
+                hotKeyNote = "Caps Lock"
+            } else if id == state.selectedSourceID2 {
+                title += "   🌐 Fn"
+                hotKeyNote = "Fn (Globe)"
+            }
+
+            let menuItem = NSMenuItem(title: title, action: #selector(layoutMenuItemSelected(_:)), keyEquivalent: "")
             menuItem.target = self
 
             // Determine selected state
-            let isSelected = (id == state.selectedSourceID1 || id == state.selectedSourceID2)
+            let isSelected = (hotKeyNote != nil)
             menuItem.state = isSelected ? .on : .off
 
             // Determine enabled state (can select if < 2 already selected, or if deselecting this one)
@@ -787,7 +974,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menuItem.isEnabled = isSelected || canSelectMore
 
             // Add tooltips for clarity
-            menuItem.toolTip = "Keyboard Layout: \(name) (\(id))"
+            menuItem.toolTip = hotKeyNote != nil
+                ? "Layout: \(name) (\(id)) — activated by \(hotKeyNote!)"
+                : "Keyboard Layout: \(name) (\(id))"
 
             menu.insertItem(menuItem, at: insertIndex + offset)
             state.menuItemToSourceMap[menuItem] = source // Map item to source object
@@ -1098,8 +1287,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        Logger.eventTap.info("Creating synchronous event tap (Listening for VK=\(self.triggerKeyCode))...")
-        let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue) // Only listen for KeyDown
+        Logger.eventTap.info("Creating synchronous event tap (Listening for VK=\(self.triggerKeyCode) [CapsLock/LANG1], VK=\(self.globeKeyCode) [Fn/Globe])...")
+        let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
+            | (1 << CGEventType.keyUp.rawValue)          // Needed to detect the Globe (Fn) tap completing
+            | (1 << CGEventType.flagsChanged.rawValue)   // Modifiers; Globe diagnostics / fn-as-modifier tracking
 
         // Pass self as userInfo (refcon)
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
@@ -1208,6 +1399,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let cfString = Unmanaged<CFString>.fromOpaque(pointer).takeUnretainedValue()
         return cfString as String
+    }
+
+    /// Human-readable name for a stored input source ID (falls back to the ID itself)
+    private func displayName(forSourceID id: String?) -> String {
+        guard let id = id else { return "?" }
+        if let source = state.allSelectableSources.first(where: { self.getInputSourceID($0) == id }),
+           let name = getInputSourceLocalizedName(source) {
+            return name
+        }
+        return id
     }
 
     /// Helper to cleanly terminate the application.
