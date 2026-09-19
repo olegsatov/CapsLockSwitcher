@@ -63,3 +63,6 @@ fastlane/test_output
 
 # Xcode builds via custom derivedDataPath
 build/
+
+# macOS junk
+.DS_Store
