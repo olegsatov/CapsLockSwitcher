@@ -129,6 +129,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// and with no other key pressed in between (so fn-as-modifier chords don't switch).
     fileprivate let globeTapMaxDuration: TimeInterval = 0.5
 
+    /// True while the status-bar menu is open. The view-based layout rows keep the menu
+    /// open on click, so menu-content rebuilds are deferred until menuDidClose.
+    private var isMenuOpen = false
+
     private var statusItem: NSStatusItem?
     private var appMenu: NSMenu?
     private var statusMenuItem: NSMenuItem?
@@ -140,7 +144,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var targetSource2Ref: TISInputSource? = nil
         var availableSelectionCount: Int = 0
         var allSelectableSources: [TISInputSource] = []
-        var menuItemToSourceMap: [NSMenuItem: TISInputSource] = [:]
         var eventTap: CFMachPort? = nil
         var runLoopSource: CFRunLoopSource? = nil
         var currentOperationalState: AppOperationalState = .permissionsRequired // Start assuming permissions are needed
@@ -289,7 +292,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             state.targetSource1Ref = nil
             state.targetSource2Ref = nil
             state.allSelectableSources = []
-            state.menuItemToSourceMap = [:]
         }
 
         // 3. Determine Operational State
@@ -784,11 +786,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            Logger.ui.info("App menu created and assigned.")
         }
 
+        updateStatusIcon(for: state.currentOperationalState) // Set the icon
+
+        if isMenuOpen {
+            // The menu is currently open (view-based layout rows keep it open on click).
+            // Tearing down the item tree during tracking would break the open menu,
+            // so the content rebuild is deferred to menuDidClose.
+            Logger.ui.debug("Menu is open; deferring menu content rebuild until menuDidClose.")
+            return
+        }
+
         // Always clear and rebuild the menu content based on current state
         appMenu?.removeAllItems()
         statusMenuItem = nil // Reset status menu item reference
-
-        updateStatusIcon(for: state.currentOperationalState) // Set the icon
 
         // Build menu items based on state
         switch state.currentOperationalState {
@@ -885,6 +895,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateMenuState() {
         dispatchPrecondition(condition: .onQueue(DispatchQueue.main))
+        guard !isMenuOpen else {
+            // The menu is open: content changes are deferred to menuDidClose. Clicks on
+            // layout rows refresh the visible rows in place instead (refreshOpenMenuContent).
+            Logger.ui.debug("Skipping menu state update: menu is currently open.")
+            return
+        }
         guard state.currentOperationalState == .configuring || self.state.currentOperationalState == .active,
               let menu = appMenu else {
             Logger.ui.debug("Skipping menu state update (not in configuring/active state or menu nil)")
@@ -894,14 +910,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Update Status Text
         if let statusItem = self.statusMenuItem { // Use the stored reference
-            switch state.currentOperationalState {
-            case .active:
-                statusItem.title = "Active: Caps Lock → \(displayName(forSourceID: state.selectedSourceID1)), Fn → \(displayName(forSourceID: state.selectedSourceID2))"
-            case .configuring:
-                statusItem.title = (state.availableSelectionCount == 1) ? "Select 1 more layout..." : "Select 2 layouts..."
-            default: // Should not happen based on guard, but good practice
-                 statusItem.title = "Status: Unknown"
-            }
+            statusItem.title = currentStatusLineTitle()
              Logger.ui.debug("Status menu item text set to: \(statusItem.title)")
         } else {
              Logger.ui.warning("Cannot update status text: statusMenuItem reference is nil.")
@@ -912,6 +921,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Update Globe (Fn) key status section
         updateGlobeKeyMenuItems(in: menu)
+    }
+
+    /// Title for the status line at the top of the menu, based on the current operational state.
+    private func currentStatusLineTitle() -> String {
+        switch state.currentOperationalState {
+        case .active:
+            return "Active: Caps Lock → \(displayName(forSourceID: state.selectedSourceID1)), Fn → \(displayName(forSourceID: state.selectedSourceID2))"
+        case .configuring:
+            return (state.availableSelectionCount == 1) ? "Select 1 more layout..." : "Select 2 layouts..."
+        default:
+            return "Status: Unknown"
+        }
     }
 
 
@@ -938,48 +959,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
              Logger.ui.debug("No existing layout items found to remove.")
         }
 
-        // Clear the map before rebuilding
-        state.menuItemToSourceMap.removeAll()
-
         let insertIndex = firstSepIndex + 1 // Index where new items will start
-        Logger.ui.debug("Adding \(self.state.allSelectableSources.count) new layout items at index \(insertIndex)...")
+        Logger.ui.debug("Adding \(self.state.allSelectableSources.count) view-based layout rows (click keeps the menu open) at index \(insertIndex)...")
 
-        // Add items for currently available selectable sources
+        // Rows are VIEW-based menu items: clicking a row does not dismiss the menu, so the
+        // user can try each layout live and watch the checkmarks move in place.
+        var rowWidth: CGFloat = 260
+        for source in state.allSelectableSources {
+            if let name = getInputSourceLocalizedName(source) {
+                rowWidth = max(rowWidth, LayoutMenuItemView.preferredWidth(forTitle: name))
+            }
+        }
+
         for (offset, source) in state.allSelectableSources.enumerated() {
             guard let name = getInputSourceLocalizedName(source), let id = getInputSourceID(source) else {
                 Logger.ui.warning("Skipping layout item: Could not get name or ID for a source.")
                 continue
             }
 
-            // Annotate which hot key activates the selected layouts (slot 1 = Caps Lock, slot 2 = Fn/Globe)
-            var title = name
-            var hotKeyNote: String? = nil
-            if id == state.selectedSourceID1 {
-                title += "   ⇪ Caps Lock"
-                hotKeyNote = "Caps Lock"
-            } else if id == state.selectedSourceID2 {
-                title += "   🌐 Fn"
-                hotKeyNote = "Fn (Globe)"
+            let rowView = LayoutMenuItemView(title: name, sourceID: id, width: rowWidth)
+            rowView.toolTip = "Keyboard Layout: \(name) (\(id))"
+            rowView.onActivate = { [weak self] in
+                self?.handleLayoutSelection(source: source, id: id)
             }
+            refreshLayoutRow(rowView)
 
-            let menuItem = NSMenuItem(title: title, action: #selector(layoutMenuItemSelected(_:)), keyEquivalent: "")
-            menuItem.target = self
-
-            // Determine selected state
-            let isSelected = (hotKeyNote != nil)
-            menuItem.state = isSelected ? .on : .off
-
-            // Determine enabled state (can select if < 2 already selected, or if deselecting this one)
-            let canSelectMore = (state.targetSource1Ref == nil || state.targetSource2Ref == nil) // Check if slots are actually filled
-            menuItem.isEnabled = isSelected || canSelectMore
-
-            // Add tooltips for clarity
-            menuItem.toolTip = hotKeyNote != nil
-                ? "Layout: \(name) (\(id)) — activated by \(hotKeyNote!)"
-                : "Keyboard Layout: \(name) (\(id))"
-
+            let menuItem = NSMenuItem()
+            menuItem.view = rowView
             menu.insertItem(menuItem, at: insertIndex + offset)
-            state.menuItemToSourceMap[menuItem] = source // Map item to source object
         }
 
         // Add instruction text if configuring
@@ -989,7 +996,36 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
              menu.insertItem(noSourcesItem, at: insertIndex)
         }
 
-        Logger.ui.debug("Layout menu items update complete. \(self.state.menuItemToSourceMap.count) items mapped.")
+        Logger.ui.debug("Layout menu rows update complete.")
+    }
+
+    /// Recomputes the visual state (checkmark, hot-key annotation, dimming) of one layout row.
+    private func refreshLayoutRow(_ rowView: LayoutMenuItemView) {
+        let slot = slotForSourceID(rowView.sourceID)
+        // A row is clickable when it is already selected (to deselect it)
+        // or when there is still a free slot for it.
+        let canSelectMore = (state.targetSource1Ref == nil || state.targetSource2Ref == nil)
+        rowView.refresh(slot: slot, enabled: slot != 0 || canSelectMore)
+    }
+
+    /// Which slot activates a layout: 0 = not selected, 1 = Caps Lock, 2 = Fn/Globe.
+    private func slotForSourceID(_ id: String) -> Int {
+        if id == state.selectedSourceID1 { return 1 }
+        if id == state.selectedSourceID2 { return 2 }
+        return 0
+    }
+
+    /// Refreshes the visible layout rows and status line in place while the menu stays open.
+    private func refreshOpenMenuContent() {
+        guard isMenuOpen, let menu = appMenu else { return }
+        for item in menu.items {
+            if let rowView = item.view as? LayoutMenuItemView {
+                refreshLayoutRow(rowView)
+            }
+        }
+        if let statusItem = self.statusMenuItem {
+            statusItem.title = currentStatusLineTitle()
+        }
     }
 
 
@@ -1064,12 +1100,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         Logger.ui.debug("Menu Will Open...")
-        // Always run the full state check when menu opens to ensure UI is correct
+        // Always run the full state check when menu opens to ensure UI is correct.
+        // This rebuilds the menu content while it is still safe to do so
+        // (isMenuOpen is set only afterwards, before any item clicks can arrive).
         determineStateAndSetupUI(context: "MenuOpen")
+        isMenuOpen = true
         // Update launch item state *after* determineState sets up the menu
         if state.currentOperationalState == .configuring || state.currentOperationalState == .active {
             updateLaunchOnStartupItemState(menu) // Update based on current SMAppService status
         }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        Logger.ui.debug("Menu Did Close.")
+        isMenuOpen = false
+        // Content changes were deferred while the menu stayed open (view-based layout
+        // rows); rebuild the menu now that tracking has ended.
+        determineStateAndSetupUI(context: "MenuDidClose")
     }
 
     // Helper to specifically update the launch item state when menu opens
@@ -1185,44 +1232,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
      }
 
 
-    @objc func layoutMenuItemSelected(_ sender: NSMenuItem) {
+    private func handleLayoutSelection(source: TISInputSource, id: String) {
         dispatchPrecondition(condition: .onQueue(DispatchQueue.main))
-        Logger.ui.info("Layout Item Selected: '\(sender.title)' (Current state: \(sender.state == .on ? "ON" : "OFF"))")
-
-        guard let selectedSource = state.menuItemToSourceMap[sender],
-              let selectedID = getInputSourceID(selectedSource) else {
-            Logger.ui.error("Could not find TISInputSource or ID for selected menu item: '\(sender.title)'. Bailing out.")
-            NSSound.beep() // User feedback
-            return
-        }
+        Logger.ui.info("Layout Item Clicked: '\(id)' (menu stays open)")
 
         let userDefaults = UserDefaults.standard
-        let wasSelected = (sender.state == .on) // Was it checked *before* the click?
+        let wasSelected = (slotForSourceID(id) != 0) // Was it selected *before* the click?
 
         if wasSelected {
             // --- DESELECTING ---
-            Logger.ui.debug("Deselecting layout: \(selectedID)")
-            var selectionChanged = false
-            if state.selectedSourceID1 == selectedID {
+            Logger.ui.debug("Deselecting layout: \(id)")
+            if state.selectedSourceID1 == id {
                 state.selectedSourceID1 = nil
                 userDefaults.removeObject(forKey: PrefKeys.selectedSourceID1)
-                Logger.settings.info("Removed selectedSourceID1 (\(selectedID))")
-                selectionChanged = true
-            } else if state.selectedSourceID2 == selectedID {
+                Logger.settings.info("Removed selectedSourceID1 (\(id))")
+            } else if state.selectedSourceID2 == id {
                 state.selectedSourceID2 = nil
                 userDefaults.removeObject(forKey: PrefKeys.selectedSourceID2)
-                Logger.settings.info("Removed selectedSourceID2 (\(selectedID))")
-                selectionChanged = true
+                Logger.settings.info("Removed selectedSourceID2 (\(id))")
             } else {
                  // This case should ideally not happen if UI state is correct
-                Logger.ui.warning("Layout '\(selectedID)' was checked (ON) but didn't match stored ID1 ('\(self.state.selectedSourceID1 ?? "nil")') or ID2 ('\(self.state.selectedSourceID2 ?? "nil")'). Deselecting from UserDefaults anyway.")
-                 // Attempt to clear just in case state was inconsistent
-                 if userDefaults.string(forKey: PrefKeys.selectedSourceID1) == selectedID { userDefaults.removeObject(forKey: PrefKeys.selectedSourceID1)}
-                 if userDefaults.string(forKey: PrefKeys.selectedSourceID2) == selectedID { userDefaults.removeObject(forKey: PrefKeys.selectedSourceID2)}
-                 selectionChanged = true // Assume change happened
-            }
-            if !selectionChanged {
-                Logger.ui.warning("Deselection attempted for \(selectedID), but no change was made to stored IDs.")
+                Logger.ui.warning("Layout '\(id)' was selected but didn't match stored ID1 ('\(self.state.selectedSourceID1 ?? "nil")') or ID2 ('\(self.state.selectedSourceID2 ?? "nil")'). Clearing from UserDefaults anyway.")
+                 if userDefaults.string(forKey: PrefKeys.selectedSourceID1) == id { userDefaults.removeObject(forKey: PrefKeys.selectedSourceID1)}
+                 if userDefaults.string(forKey: PrefKeys.selectedSourceID2) == id { userDefaults.removeObject(forKey: PrefKeys.selectedSourceID2)}
             }
 
         } else {
@@ -1239,20 +1271,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return // Already have 2 valid selections
             }
 
-            // Assign to the first available slot (prefer slot 1)
+            // Assign to the first available slot (prefer slot 1 = Caps Lock)
             if !slot1Filled {
-                Logger.ui.debug("Selecting for Slot 1: \(selectedID)")
-                state.selectedSourceID1 = selectedID
-                userDefaults.set(selectedID, forKey: PrefKeys.selectedSourceID1)
-                 Logger.settings.info("Set selectedSourceID1 = \(selectedID)")
+                Logger.ui.debug("Selecting for Slot 1 (Caps Lock): \(id)")
+                state.selectedSourceID1 = id
+                userDefaults.set(id, forKey: PrefKeys.selectedSourceID1)
+                 Logger.settings.info("Set selectedSourceID1 = \(id)")
             } else if !slot2Filled { // Only try slot 2 if slot 1 is already filled
-                 Logger.ui.debug("Selecting for Slot 2: \(selectedID)")
-                 state.selectedSourceID2 = selectedID
-                 userDefaults.set(selectedID, forKey: PrefKeys.selectedSourceID2)
-                 Logger.settings.info("Set selectedSourceID2 = \(selectedID)")
+                 Logger.ui.debug("Selecting for Slot 2 (Fn/Globe): \(id)")
+                 state.selectedSourceID2 = id
+                 userDefaults.set(id, forKey: PrefKeys.selectedSourceID2)
+                 Logger.settings.info("Set selectedSourceID2 = \(id)")
             } else {
                  // This case should be caught by the 'totalFilledSlots < 2' guard
-                 Logger.ui.error("Logic Error: Tried to select layout \(selectedID) but both slots seem filled despite guard passing.")
+                 Logger.ui.error("Logic Error: Tried to select layout \(id) but both slots seem filled despite guard passing.")
                  NSSound.beep()
                  return
             }
@@ -1261,10 +1293,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Persist changes immediately
         userDefaults.synchronize()
 
-        // Crucially, re-run the state determination logic to update everything
-        Logger.ui.info("Re-determining state after layout selection change for ID: \(selectedID)")
-        // Use a specific context
+        // Re-run the state determination logic (hidutil remap, event tap, icon, etc.).
+        // While the menu is open the menu-content rebuild inside is deferred to
+        // menuDidClose; the visible rows are refreshed in place below instead.
+        Logger.ui.info("Re-determining state after layout selection change for ID: \(id)")
         determineStateAndSetupUI(context: wasSelected ? "LayoutDeselected" : "LayoutSelected")
+
+        // Refresh the open menu in place with the updated state (checkmarks, status text)
+        refreshOpenMenuContent()
 
      }
 
@@ -1425,6 +1461,141 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
 } // End of AppDelegate class
+
+// MARK: - View-Based Layout Row (keeps the menu open when clicked)
+
+/// A menu item view for a keyboard layout row. Because the row is a view (not a
+/// standard menu item with an action), clicking it does NOT dismiss the menu —
+/// the user can try each layout live and see the checkmarks update in place.
+final class LayoutMenuItemView: NSView {
+
+    var onActivate: (() -> Void)?
+
+    let sourceID: String
+    private var titleText: String
+    private var slot: Int          // 0 = not selected, 1 = Caps Lock, 2 = Fn/Globe
+    private var rowEnabled: Bool
+
+    private var isHovered = false { didSet { needsDisplay = true } }
+    private var isPressed = false { didSet { needsDisplay = true } }
+    private var trackingArea: NSTrackingArea?
+
+    init(title: String, sourceID: String, width: CGFloat) {
+        self.titleText = title
+        self.sourceID = sourceID
+        self.slot = 0
+        self.rowEnabled = true
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 22))
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    static func preferredWidth(forTitle title: String) -> CGFloat {
+        let font = NSFont.menuFont(ofSize: 0)
+        let titleWidth = (title as NSString).size(withAttributes: [.font: font]).width
+        // Checkmark column + room for the trailing hot-key annotation + padding
+        return max(260, ceil(titleWidth) + 150)
+    }
+
+    /// Updates the row's visual state in place (no menu rebuild needed).
+    func refresh(slot newSlot: Int, enabled: Bool) {
+        slot = newSlot
+        rowEnabled = enabled
+        needsDisplay = true
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingArea {
+            removeTrackingArea(existing)
+        }
+        // .activeAlways so the hover highlight works while the menu is tracking.
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeAlways],
+                                  owner: self,
+                                  userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        isPressed = false
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        isPressed = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let wasPressed = isPressed
+        isPressed = false
+        guard rowEnabled, wasPressed else { return }
+        let location = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(location) else { return }
+        onActivate?()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let highlighted = rowEnabled && (isHovered || isPressed)
+
+        if highlighted {
+            let background = NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1.5), xRadius: 4, yRadius: 4)
+            NSColor.controlAccentColor.setFill()
+            background.fill()
+        }
+
+        let font = NSFont.menuFont(ofSize: 0)
+        let textColor: NSColor = !rowEnabled
+            ? .disabledControlTextColor
+            : (highlighted ? .alternateSelectedControlTextColor : .labelColor)
+        let secondaryColor: NSColor = !rowEnabled
+            ? .disabledControlTextColor
+            : (highlighted ? textColor.withAlphaComponent(0.85) : .secondaryLabelColor)
+
+        // Checkmark column (always reserved, so rows don't shift when selected)
+        let checkmark = NSAttributedString(
+            string: slot != 0 ? "✓" : " ",
+            attributes: [.font: font, .foregroundColor: textColor])
+        checkmark.draw(at: NSPoint(x: 14, y: (bounds.height - checkmark.size().height) / 2 + 0.5))
+
+        // Layout name
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingMiddle
+        let titleString = NSAttributedString(
+            string: titleText,
+            attributes: [.font: font, .foregroundColor: textColor, .paragraphStyle: paragraph])
+
+        let annotationText = slot == 1 ? "⇪ Caps Lock" : (slot == 2 ? "🌐 Fn" : nil)
+        var annotationWidth: CGFloat = 0
+        if let annotationText = annotationText {
+            let annotation = NSAttributedString(string: annotationText,
+                                                attributes: [.font: font, .foregroundColor: secondaryColor])
+            annotationWidth = annotation.size().width
+        }
+
+        var titleRect = bounds
+        titleRect.origin.x = 34
+        titleRect.origin.y = (bounds.height - titleString.size().height) / 2 + 0.5
+        titleRect.size.height = titleString.size().height
+        titleRect.size.width = bounds.width - 34 - (annotationWidth > 0 ? annotationWidth + 24 : 16)
+        titleString.draw(in: titleRect)
+
+        // Trailing hot-key annotation for the selected layouts
+        if let annotationText = annotationText {
+            let annotation = NSAttributedString(string: annotationText,
+                                                attributes: [.font: font, .foregroundColor: secondaryColor])
+            annotation.draw(at: NSPoint(x: bounds.width - annotationWidth - 16,
+                                        y: (bounds.height - annotation.size().height) / 2 + 0.5))
+        }
+    }
+}
 
 // MARK: - Bundle Extension
 
