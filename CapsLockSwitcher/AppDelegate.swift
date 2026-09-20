@@ -23,7 +23,7 @@ extension Logger {
 // MARK: - Global Event Tap Callback (SYNCHRONOUS - Listens for CapsLock/LANG1 and Fn/Globe)
 
 private func eventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
-    guard type == .keyDown || type == .keyUp || type == .flagsChanged else {
+    guard type == .keyDown || type == .flagsChanged else {
         return Unmanaged.passRetained(event)
     }
 
@@ -35,7 +35,7 @@ private func eventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
     let delegate = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
 
     let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-    Logger.eventTap.debug("Tap event: \(type == .keyDown ? "keyDown" : (type == .keyUp ? "keyUp" : "flagsChanged")), code: \(keyCode)")
+    Logger.eventTap.debug("Tap event: \(type == .keyDown ? "keyDown" : "flagsChanged"), code: \(keyCode), flags: \(event.flags.rawValue)")
 
     // --- Caps Lock (remapped by hidutil to LANG1, keycode 104): activate layout slot 1 ---
     if type == .keyDown && keyCode == Int64(delegate.triggerKeyCode) {
@@ -53,25 +53,33 @@ private func eventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
         }
     }
 
-    // --- Fn/Globe key (keycode 179): activate layout slot 2 on keyDown, with fn+key chord undo ---
-    if keyCode == Int64(delegate.globeKeyCode) {
-        if type == .keyDown {
+    // --- Fn/Globe key: watch the fn FLAG via flagsChanged ---
+    // A long press/hold produces NO keyDown/keyUp events for the Globe key — macOS
+    // synthesizes the 179-key pair only for a quick tap, on release. The fn flag,
+    // however, announces the physical press and release at once, for any duration.
+    if type == .flagsChanged {
+        let fnDown = (event.flags.rawValue & (1 << 23)) != 0 // kCGEventFlagMaskSecondaryFn
+        if fnDown && !delegate.globeIsDown {
+            // fn pressed → switch immediately, remember the pre-press layout
+            delegate.globeIsDown = true
             guard delegate.checkKnownPermissionsFlag() else {
                 return Unmanaged.passRetained(event)
             }
             delegate.activateGlobeSlotSync()
             return Unmanaged.passRetained(event)
         }
-        if type == .keyUp {
-            // The chord window is over: a plain press keeps the new layout.
+        if !fnDown && delegate.globeIsDown {
+            // fn released → chord window over; a plain press keeps the new layout
+            delegate.globeIsDown = false
             delegate.globeChordSavedSource = nil
             return Unmanaged.passRetained(event)
         }
+        // Other modifier changes while fn is held (e.g. shift down/up) fall through here
         return Unmanaged.passRetained(event)
     }
 
-    // --- Any other key pressed while the Globe key is still held → fn+key chord: undo ---
-    if type == .keyDown, delegate.globeChordSavedSource != nil {
+    // --- Any other key pressed while fn is held → fn+key chord: undo the switch ---
+    if delegate.globeChordSavedSource != nil {
         delegate.undoGlobeChordSwitch()
     }
 
@@ -111,9 +119,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// open on click, so menu-content rebuilds are deferred until menuDidClose.
     private var isMenuOpen = false
 
-    /// The layout that was active before the last Globe (Fn) press. While the Globe key
-    /// is still held, any other keyDown (an fn+key chord) restores this layout.
+    /// The layout that was active before the last Globe (Fn) press. While fn is held,
+    /// any other keyDown (an fn+key chord) restores this layout.
     fileprivate var globeChordSavedSource: TISInputSource?
+    /// True from the fn-down flagsChanged until the fn-up flagsChanged.
+    fileprivate var globeIsDown = false
 
     private var statusItem: NSStatusItem?
     private var appMenu: NSMenu?
@@ -1334,9 +1344,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        Logger.eventTap.info("Creating synchronous event tap (Listening for VK=\(self.triggerKeyCode) [CapsLock/LANG1], VK=\(self.globeKeyCode) [Fn/Globe])...")
+        Logger.eventTap.info("Creating synchronous event tap (Listening for VK=\(self.triggerKeyCode) [CapsLock/LANG1] and the fn flag via flagsChanged [Fn/Globe])...")
         let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
-            | (1 << CGEventType.keyUp.rawValue) // Needed to close the Globe chord-undo window on release
+            | (1 << CGEventType.flagsChanged.rawValue) // fn flag press/release; any hold duration
 
         // Pass self as userInfo (refcon)
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
