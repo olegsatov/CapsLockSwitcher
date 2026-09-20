@@ -53,20 +53,26 @@ private func eventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
         }
     }
 
-    // --- Fn/Globe key (keycode 179): activate layout slot 2 on keyDown (same feel as Caps Lock) ---
+    // --- Fn/Globe key (keycode 179): activate layout slot 2 on keyDown, with fn+key chord undo ---
     if keyCode == Int64(delegate.globeKeyCode) {
-        guard type == .keyDown else {
+        if type == .keyDown {
+            guard delegate.checkKnownPermissionsFlag() else {
+                return Unmanaged.passRetained(event)
+            }
+            delegate.activateGlobeSlotSync()
             return Unmanaged.passRetained(event)
         }
-        guard delegate.checkKnownPermissionsFlag() else {
+        if type == .keyUp {
+            // The chord window is over: a plain press keeps the new layout.
+            delegate.globeChordSavedSource = nil
             return Unmanaged.passRetained(event)
         }
-        let shouldConsume = delegate.performSwitchSync(slot: 2)
-        if shouldConsume {
-            return nil // Attempt to consume the Globe event (no-op for .listenOnly taps)
-        } else {
-            return Unmanaged.passRetained(event)
-        }
+        return Unmanaged.passRetained(event)
+    }
+
+    // --- Any other key pressed while the Globe key is still held → fn+key chord: undo ---
+    if type == .keyDown, delegate.globeChordSavedSource != nil {
+        delegate.undoGlobeChordSwitch()
     }
 
     return Unmanaged.passRetained(event)
@@ -104,6 +110,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// True while the status-bar menu is open. The view-based layout rows keep the menu
     /// open on click, so menu-content rebuilds are deferred until menuDidClose.
     private var isMenuOpen = false
+
+    /// The layout that was active before the last Globe (Fn) press. While the Globe key
+    /// is still held, any other keyDown (an fn+key chord) restores this layout.
+    fileprivate var globeChordSavedSource: TISInputSource?
 
     private var statusItem: NSStatusItem?
     private var appMenu: NSMenu?
@@ -419,6 +429,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // Consume the event either way: an attempt was made based on app state
         return true
+    }
+
+    // MARK: - Fn/Globe Chord Undo
+
+    /// Globe press: remember the currently active layout (for a possible chord-undo)
+    /// and switch to the Fn/Globe layout (slot 2) right away.
+    fileprivate func activateGlobeSlotSync() {
+        guard state.currentOperationalState == .active else {
+            Logger.eventTap.debug("Globe press: pass through. State is not Active.")
+            return
+        }
+        // Save the currently active source so that an fn+key chord can undo the switch
+        if let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() {
+            globeChordSavedSource = current
+        }
+        _ = performSwitchSync(slot: 2)
+    }
+
+    /// Another key was pressed while the Globe key was still held (fn+key chord):
+    /// restore the layout that was active before the Globe press. Idempotent —
+    /// repeated chord keyDowns just re-select the saved layout.
+    fileprivate func undoGlobeChordSwitch() {
+        guard state.currentOperationalState == .active, let saved = globeChordSavedSource else { return }
+        let status = TISSelectInputSource(saved)
+        if status != noErr {
+            Logger.eventTap.error("Globe chord undo FAILED: TISSelectInputSource error \(status).")
+        } else {
+            Logger.eventTap.debug("Globe chord undo: restored the pre-press layout.")
+        }
     }
 
 
@@ -1296,7 +1335,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         Logger.eventTap.info("Creating synchronous event tap (Listening for VK=\(self.triggerKeyCode) [CapsLock/LANG1], VK=\(self.globeKeyCode) [Fn/Globe])...")
-        let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue) // Only listen for KeyDown
+        let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
+            | (1 << CGEventType.keyUp.rawValue) // Needed to close the Globe chord-undo window on release
 
         // Pass self as userInfo (refcon)
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
