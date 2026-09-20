@@ -53,41 +53,20 @@ private func eventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
         }
     }
 
-    // --- Fn/Globe key (keycode 179): activate layout slot 2 on a *tap* ---
+    // --- Fn/Globe key (keycode 179): activate layout slot 2 on keyDown (same feel as Caps Lock) ---
     if keyCode == Int64(delegate.globeKeyCode) {
-        switch type {
-        case .keyDown:
-            delegate.globeKeyDownUptime = ProcessInfo.processInfo.systemUptime
-            delegate.otherKeyPressedWhileGlobeDown = false
-        case .keyUp:
-            let startTime = delegate.globeKeyDownUptime
-            delegate.globeKeyDownUptime = 0 // Always reset, regardless of the outcome
-            let heldFor = ProcessInfo.processInfo.systemUptime - startTime
-            // Count as a tap only if released quickly and no other key was pressed while held,
-            // so using Fn as a modifier (fn+F1, fn+letter, ...) never switches the layout.
-            let wasTap = startTime > 0
-                && heldFor <= delegate.globeTapMaxDuration
-                && !delegate.otherKeyPressedWhileGlobeDown
-            Logger.eventTap.debug("Globe key released after \(heldFor)s; tap=\(wasTap)")
-            guard wasTap else { break }
-            guard delegate.checkKnownPermissionsFlag() else {
-                return Unmanaged.passRetained(event)
-            }
-            let shouldConsume = delegate.performSwitchSync(slot: 2)
-            if shouldConsume {
-                return nil // Attempt to consume the Globe event (no-op for .listenOnly taps)
-            } else {
-                return Unmanaged.passRetained(event)
-            }
-        default:
-            break // flagsChanged: fn flag press/release, diagnostics only
+        guard type == .keyDown else {
+            return Unmanaged.passRetained(event)
         }
-        return Unmanaged.passRetained(event)
-    }
-
-    // --- Any other key pressed while the Globe key is down → it's a chord (fn+key), not a tap ---
-    if type == .keyDown && delegate.globeKeyDownUptime > 0 {
-        delegate.otherKeyPressedWhileGlobeDown = true
+        guard delegate.checkKnownPermissionsFlag() else {
+            return Unmanaged.passRetained(event)
+        }
+        let shouldConsume = delegate.performSwitchSync(slot: 2)
+        if shouldConsume {
+            return nil // Attempt to consume the Globe event (no-op for .listenOnly taps)
+        } else {
+            return Unmanaged.passRetained(event)
+        }
     }
 
     return Unmanaged.passRetained(event)
@@ -121,13 +100,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private var isShowingPermissionAlert = false
-
-    // --- Globe (Fn) key tap tracking (only touched from the event tap callback on the main run loop) ---
-    fileprivate var globeKeyDownUptime: TimeInterval = 0
-    fileprivate var otherKeyPressedWhileGlobeDown = false
-    /// A Globe press counts as a "tap" (layout switch) only if released within this time
-    /// and with no other key pressed in between (so fn-as-modifier chords don't switch).
-    fileprivate let globeTapMaxDuration: TimeInterval = 0.5
 
     /// True while the status-bar menu is open. The view-based layout rows keep the menu
     /// open on click, so menu-content rebuilds are deferred until menuDidClose.
@@ -1324,9 +1296,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         Logger.eventTap.info("Creating synchronous event tap (Listening for VK=\(self.triggerKeyCode) [CapsLock/LANG1], VK=\(self.globeKeyCode) [Fn/Globe])...")
-        let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
-            | (1 << CGEventType.keyUp.rawValue)          // Needed to detect the Globe (Fn) tap completing
-            | (1 << CGEventType.flagsChanged.rawValue)   // Modifiers; Globe diagnostics / fn-as-modifier tracking
+        let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue) // Only listen for KeyDown
 
         // Pass self as userInfo (refcon)
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
